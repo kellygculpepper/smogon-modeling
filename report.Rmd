@@ -1,0 +1,222 @@
+---
+title: "Modeling Usage in Pokémon Showdown"
+author: "Kelly Culpepper"
+date: "2023-12-17"
+output:
+  pdf_document: 
+    extra_dependencies: ["float"]
+  html_document: default
+bibliography: references.bib
+geometry: left=2.5cm, right=2.5cm, bottom=3cm, top=2cm
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(data.table)
+library(mgcv)
+library(itsadug)
+library(gratia)
+
+options(xtable.comment = FALSE,
+        xtable.table.placement="H")
+```
+
+## Introduction
+
+In contrast to the more established field of sports analytics, the statistical literature on Esports and competitive gaming is still emerging [-@esports]. One game ripe for such research is competitive Pokémon, specifically Pokémon Showdown. Pokémon Showdown is an online simulator where players around the globe challenge each other to battles in a variety of competitive game modes. The game is popular, with about 10,000 concurrent users, millions of views on Youtube, and a surge in interest with the 2022 release of *Pokémon Scarlet* and *Pokémon Violet*.
+
+A successful competitive player must strategize extensively, both when building their teams and selecting moves during the turn-based combat. A key element of strategy is understanding the current metagame, i.e. which Pokémon, builds, and strategies are strong or popular. Someone who could predict the future metagame could prepare and practice anti-meta strategies ahead of time, conferring a massive advantage. Metagame relevance is typically quantified through a Pokémon's usage rate, the percentage of all teams that include that Pokémon. This measure likely depends on both intrinsic qualities of the Pokémon---like its numerical stats, typing, or moves---and situational factors that vary between game modes and over time. Since potential situational factors are complex, interconnected, and often difficult to quantify, I will leave these for future research. By focusing on intrinsic attributes, I adopt an approach similar to Navas & Donohue [-@tier_study]. Note that their models predict the game mode classification of Pokémon, and do not model meta relevance within a game mode.
+
+In this paper, I aim to model Pokémon usage based on numerical statistics, typing, and movesets. I will specifically use the current most popular game mode, Generation 9 OU. Since the release of the Pokémon HOME update mid-2023 disrupted this metagame substantially, I will fit separate models for before and after the update. I hope to understand the attributes of a Pokémon that contribute to competitive relevance, and whether this has changed since the HOME update. I also hope to develop a model that predicts usage as well as possible, which could be used to anticipate metagame trends or the relevance of new Pokémon. More broadly, this research will contribute to the small body of literature on competitive Pokémon, opening the doors for more targeted analysis in the future.
+
+## Data
+
+Monthly usage rates and raw counts for each Pokémon were sourced from Smogon's publicly-available data. I pulled all 13 months of data from Generation 9 OU, dating back to November 2022. I opted for the total usage statistics among players of all Elo ratings, to examine overall trends across a large sample.
+
+For information on Pokémon's stats and typing, I used the `pokemonData` dataset maintained by Len Greski on GitHub. Naming conventions differed between the two datasets, so I wrote an algorithm that uses conditional regular expressions to match the records.
+
+Finally, I retrieved information on Pokémon movesets from Bulbapedia. Given the large number of moves, I focused on three competitively relevant categories: pivot moves, hazard setting, and hazard control.
+
+Pivot moves are moves that deal damage and switch the user out: U-Turn, Volt Switch, and Flip Turn. These are flexible, "safe" moves that allow players to re-position without losing momentum. Hazard setting includes any move that sets damage-dealing entry hazards: Spikes, Stealth Rock, Toxic Spikes, and Ceaseless Edge. Finally, hazard control encompasses moves and abilities that clear or block hazards: Rapid Spin, Defog, Court Change, Tidy Up, Mortal Spin, and Magic Bounce.
+
+Given the primacy of entry hazards in modern competitive play and the popularity of "hazard-stacking" teams in early Generation 9 OU, I anticipated that Pokémon that could set or clear hazards would be popular. Using Bulbapedia, I manually gathered the IDs of Pokémon that satisfied these three categories and created an indicator variable for each. I additionally used Bulbapedia to collect the stats of the Teal Mask DLC Pokémon, which are not included in `pokemonData`.
+
+Typing has a few different effects in Pokémon. Offensively, Same-Type Attack Bonus (STAB) boosts the power of moves sharing a Pokémon's type(s). Defensively, each type grants a multiplier of 0, 0.5, 1, or 2 on moves of each type, in a network of relationships known as the "type chart." Because the multipliers from a dual-typed Pokémon's primary and secondary types are multiplied together during damage calculation, it is unreasonable to model the effects of typing additively. This is reflected in popular wisdom that some type combinations are particularly bad or good, depending on whether their strengths and weaknesses are complementary.
+
+However, a multiplicative interaction between primary and secondary type would be impractical, as there are 162 unique type combinations. Instead, I represented typing with 18 numerical variables, each indicating the overall damage multiplier when defending against a particular type. This sacrifices information about STAB, as well as auxiliary effects like the Grass type's immunity to powder moves. However, it allows examination of which resistances are most valuable, or which weaknesses are most harmful. To add these variables, I created a spreadsheet of the type chart and mutated on the two typing columns, evaluating the product of the appropriate multipliers.
+
+## Exploratory Data Analysis
+
+First, we will examine the relationship between usage rates and the six numeric stats. As I observed no changes between the pre- and post-HOME periods that would substantively inform the analysis, I opted to visualize the overall mean usage rates.
+
+```{r fig.height = 3}
+
+stat_colors = c("HP" = "#D55E00", "Attack" = "#E69F00", "Defense" = "#F0E442",
+"Special Attack" = "#009E73", "Special Defense" = "#56B4E9", "Speed" = "#CC79A7")
+
+all = read.csv("data/overall.csv")
+
+all = all %>%
+  rename("Special Attack" = Sp..Atk,
+         "Special Defense" = Sp..Def)
+
+all = all %>%
+  pivot_longer(cols = HP:Speed, names_to = "stat", values_to = "val") %>%
+  mutate(stat = fct_relevel(stat, c("HP", "Attack", "Defense", "Special Attack",
+                                    "Special Defense", "Speed")))
+
+all %>%
+  ggplot(aes(x = val, y = usage, color = stat)) +
+  geom_point(alpha = 0.4, size = 1.8) +
+  theme_bw() +
+  facet_wrap(~ stat) + 
+  labs(y = "Usage Rate", x = NULL) +
+  theme(legend.position = "none") +
+  scale_color_manual(values = stat_colors) +
+  ggtitle("Overall Mean Usage Rate (%) vs Stats")
+```
+
+The plots above illustrate a highly noisy and nonlinear relationship between all six numeric stats and usage rates. Pokémon with very low values in any stat---except for some exceptions in Speed---are rarely used. The more lenient threshold for Speed makes sense because some powerful bulky Pokémon have very low Speed stats. Perhaps counterintuitively, excessively high values in the defensive stats appear to confer little benefit. While heavily specialized, or "min-maxed", stat distributions are often touted by players, it appears that overspecialized defensive Pokémon do not perform well. A final key takeaway is the high proportion of Pokémon with very low usage.
+
+Next, we investigate the relationship between usage and typing for the two time periods.
+
+```{r fig.height = 3}
+pre = read.csv("data/pre.csv")
+post = read.csv("data/post.csv")
+
+types_pre = data.frame(type = character(0), usage = numeric(0))
+types_post = data.frame(type = character(0), usage = numeric(0))
+types = unique(pre$Type1)
+
+for (curr_type in types) {
+  curr_pre_data = pre %>%
+    filter(Type1 == curr_type | Type2 == curr_type) %>%
+    mutate(type = curr_type) %>%
+    select(type, usage)
+  types_pre = rbind(types_pre, curr_pre_data)
+  
+  curr_post_data = post %>%
+    filter(Type1 == curr_type | Type2 == curr_type) %>%
+    mutate(type = curr_type) %>%
+    select(type, usage)
+  types_post = rbind(types_post, curr_post_data)
+}
+
+type_colors = c("Normal" = "#A8A878", "Fire" = "#F08030", "Water" = "#6890F0",
+                "Grass" = "#78C850", "Electric" = "#F8D030", "Ice" = "#98D8D8",
+                "Ground" = "#E0C068", "Rock" = "#B8A038", "Flying" = "#A890F0", 
+                "Poison" = "#A040A0", "Bug" = "#A8B820", "Psychic" = "#F85888",
+                "Fighting" = "#C03028", "Ghost" = "#705898", "Dark" = "#705848",
+                "Steel" = "#B8B8D0", "Fairy" = "#EE99AC", "Dragon" = "#7038F8")
+types_pre %>%
+  ggplot(aes(x = reorder(type, -log(usage), FUN = median), y = log(usage), 
+             fill = type, color = type)) +
+  geom_boxplot(alpha = 0.2) +
+  theme_bw() + 
+  scale_fill_manual(values = type_colors) +
+  scale_color_manual(values = type_colors) + 
+  theme(legend.position = "none", 
+        axis.text.x = element_text(angle = 30, vjust = 0.5, hjust=1)) +
+  labs(title = "Log-Usage by Type, Pre-HOME", y = "Usage Rate (log)", x = NULL)
+```
+
+```{r fig.height = 3}
+types_post %>%
+  ggplot(aes(x = reorder(type, -log(usage), FUN = median), y = log(usage), 
+             color = type, fill = type)) +
+  geom_boxplot(alpha = 0.2) +
+  theme_bw() +
+  scale_fill_manual(values = type_colors) +
+  scale_color_manual(values = type_colors) + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, vjust = 0.5, hjust=1)) +
+  labs(title = "Log-Usage by Type, Post-HOME", y = "Usage Rate (log)", x = NULL)
+```
+
+There are a number of similarities and differences between the pre- and post-HOME metagames in terms of typing. Fighting, Dark, and Steel remain the top three most used types in both periods. However, the relative usage of other types has shifted. For instance, usage of Fairy and Psychic Pokémon shot up after the update, while usage of Ice, Fire, and Rock Pokémon declined. Typing may be important in explaining metagame changes between the two periods.
+
+To further explore the effects of the HOME update, we compare the pre- and post-HOME usage rates of Pokémon present during both periods.
+
+```{r fig.height = 4}
+merged = merge(pre, post, by="name")
+merged %>%
+  ggplot(aes(x = usage.x, y = usage.y)) +
+  geom_point(alpha = 0.3, shape = 21, fill = "#ff6345", color = "#ff330a", 
+             size = 3) +
+  theme_bw() +
+  labs(title = "Mean Usage Rates (%) Before and After HOME Update", x = "Pre-HOME",
+       y = "Post-HOME")
+```
+
+As one might expect, there is a strong positive linear relationship between pre- and post-HOME usage. Post-HOME usage rates are on average a bit lower than pre-HOME rates, but keep in mind that Pokémon added during the HOME update are excluded from the graph. Despite the generally strong relationship, we see a fair amount of variation. In particular, we see clusters of Pokémon with moderate rates in the 5-10% range that experienced large proportional increases or decreases in usage due to the update. This supports the approach of modeling the two periods separately.
+
+## Modeling
+
+Given the nature and heavy skewness of the data, I opted for a negative binomial regression model on the counts. I also considered Poisson models, but noted substantial overdispersion when attempting to fit them, motivating the switch to a negative binomial distribution. To create relatively interpretable models while still accounting for the nonlinear effects of the numerical stats, I fit GAMs with smooth functions of the six numerical stats, and the damage multipliers and move categories as parametric features.
+
+I also considered a couple of interactions in the form of tensor products, which are supported by the `mgcv` package. Since damage taken is roughly inversely proportional to the product of HP and the appropriate defensive stat, I tried adding interactions of HP with Defense and Special Defense. I furthermore considered interactions of Speed with Attack and Special Attack, as offensive Pokémon often benefit from attacking first. For both models, I found that all of these interactions reduced the AIC, so I included all four.
+
+## Pre-HOME Model
+
+```{r include=FALSE}
+gam_pre_int = gam(count ~ te(hp, def, k = 5) + te(hp, spdef, k = 5) + te(spatk, spd, k = 6) + te(atk, spd, k = 5) + pivot + hazard + hazard_control + mult_Normal + mult_Grass + mult_Water + mult_Fire + mult_Electric + mult_Ground + mult_Rock + mult_Flying + mult_Fighting + mult_Bug + mult_Psychic + mult_Dark + mult_Ghost + mult_Steel + mult_Dragon + mult_Fairy + mult_Ice + mult_Poison, family = nb, data = pre, select = TRUE, method = "REML")
+
+gam_post_int = gam(count ~ te(hp, def, k = 5) + te(hp, spdef, k = 5) + te(spatk, spd, k = 6) + te(atk, spd, k = 5) + pivot + hazard + hazard_control + mult_Normal + mult_Grass + mult_Water + mult_Fire + mult_Electric + mult_Ground + mult_Rock + mult_Flying + mult_Fighting + mult_Bug + mult_Psychic + mult_Dark + mult_Ghost + mult_Steel + mult_Dragon + mult_Fairy + mult_Ice + mult_Poison, family = nb, data = post, select = TRUE, method = "REML")
+```
+
+```{r warning = FALSE, results = "asis", message = FALSE}
+gamtabs(gam_pre_int, caption = "Results of Pre-Home Model", label = "tab1")
+```
+
+The pre-HOME model provides a number of insights about this period of the metagame. I did not find evidence that most of the damage multipliers had a relationship with usage after accounting for other variables. However, the multipliers for damage from the Normal, Water, Electric, Ground, Flying, and Ghost types did have a statistically significant relationship with usage. Normal and Ghost had negative coefficients, suggesting that these are particularly important types to resist. In the case of Normal, I believe this effect may partly be a proxy for whether a Pokémon is Ghost type or not, since Ghost types are immune to Normal and are a generally strong type. The positive multipliers for Electric, Ground, Flying, and Water suggest it is less important to resist these types. Of the move categories, only hazard-setting was statistically significant, but with a negative coefficient. This is surprising, and contradicts my expectation that Pokémon with meta moves will perform better. Finally, the interactions between the numerical stats were all significant, and performed better compared to a model with only additive effects. This suggests that the effect of offensive stats depends on Speed, the effect of defensive stats depends on HP, and vice versa.
+
+For a closer look at the effect of numerical stats in the model, I created 2D plots for each of the interactions.
+
+```{r}
+draw(gam_pre_int)
+```
+
+Pokémon with high values for both stats in a pair tend to perform well, but there are certain hotspots of high usage. An interesting result is the region of Pokémon with very low Speed and moderate Attack, perhaps reflecting defensive and bulky physical Pokémon. This confirms that low Speed is not always detrimental.
+
+```{r message=FALSE, results='hide',fig.keep='all'}
+par(mfrow=c(2,1))
+invisible(gam.check(gam_pre_int))
+par(mfrow=c(1,1))
+```
+
+The residuals are generally randomly distributed. The residuals deviate somewhat from a normal distribution, being right-skewed, so this model tends to overestimate usage. Finally, the fitted vs response plot appears quite strange, but this is because it is scaled to a couple of outliers, which have much higher predicted than actual usage. Upon closer inspection, these points are Pokémon with very high base stats but low usage due to factors that our model cannot capture. For instance, the Pokémon Slaking has very high stats overall, which on paper and in our model should make it powerful, but its unique self-sabotaging ability Truant renders it irrelevant. Overall, the model fits reasonably well for most points, but very poorly on a few points.
+
+## Post-HOME Model
+
+```{r warning = FALSE, results = "asis"}
+gamtabs(gam_post_int, caption = "Results of Post-Home Model", label = "tab2")
+```
+
+Examining these results reveals some important similarities and differences with the pre-HOME metagame. We have evidence that many of the same damage multipliers affect usage, and with the same directionality as before. However, the effect of Flying is no longer significant, while the multipliers for Fighting and Steel are now statistically significant. Both of these have negative coefficients, suggesting they are important types to resist. Considering that Fighting and Steel were among the top 3 most used types for both periods, this effect is not surprising; rather, it is perhaps surprising that we could not find evidence of their effect in the pre-HOME metagame. Rather than hazard-setting, pivot moves are now the only statistically significant move category, also with a negative coefficient. This remains surprising, but could be explained by the wide distribution of U-turn to many otherwise weak Bug- and Flying-type Pokémon.
+
+To compare the impact of numerical stats, we again consider the interaction plots.
+
+```{r}
+draw(gam_post_int)
+```
+
+The relationships are somewhat similar between the two models, but with some changes both in the interactions and in the actual distribution of stats (due to roster changes). The Attack-Speed interaction particularly seems different, as it now has a positive effect for Speed \> 100 only if Attack is also high.
+
+```{r message=FALSE, results='hide',fig.keep='all'}
+par(mfrow=c(2,1))
+invisible(gam.check(gam_post_int))
+par(mfrow=c(1,1))
+```
+
+The fit of the post-HOME model is very comparable to the pre-HOME model. The overall fit is reasonable, but there is skewness in the residuals and a few very inaccurate predictions, again due to variables that the data doesn't capture.
+
+## Conclusions
+
+I found that a negative binomial GAM using move categories, damage multipliers, and products of numerical stats was able to predict Pokémon usage with some accuracy. I found that usage relates not only to numerical stats, but to the nonlinear interactions between HP and defensive stats and Speed and offensive stats. Counterintuitively, access to meta-relevant pivot and hazard-setting moves was associated with poorer performance. Comparing the two models suggests that the Generation 9 metagame was relatively stable through the Pokémon HOME update, but with some shifts in the effect of both numerical stats and certain type matchups (particularly Steel and Fighting).
+
+While I believe these models provide a valuable basis for predicting usage with easily-observed intrinsic variables, I also recognize the significant limitations of this approach. The poor performance of the models on certain Pokémon with high base stats but other major weaknesses highlights the need for additional features. Given that many of these outlier predictions corresponded to Pokémon like Slaking that are limited by their ability or movepool (rather than by transient metagame conditions), a logical next step for future research would be finding ways to incorporate these variables. Due to the large number of moves and abilities, as well as the diversity of their mechanics, this will require careful engineering.
+
+\newpage
+
+## Citations
